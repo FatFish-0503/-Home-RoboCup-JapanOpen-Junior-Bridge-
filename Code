@@ -1,0 +1,465 @@
+#! usv/bin/env python3.8
+# need navigation and robot arm code
+import rospy
+from sensor_msgs.msg import Image,Imu
+import cv2
+import time
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+from mr_voice.msg import Voice
+from std_msgs.msg import String
+from geometry_msgs.msg import Twist
+from tf.transformations import euler_from_quaternion
+import numpy as np
+import math
+from RobotChassis import RobotChassis
+from open_manipulator_msgs.srv import SetJointPosition, SetJointPositionRequest
+import pyautogui
+
+def callback_voice(msg):
+    global _voice
+    _voice = msg
+
+def callback_Imu(msg):
+    global _Imu
+    _Imu = msg
+
+def callback_image(msg):
+    global _image
+    _image = CvBridge().imgmsg_to_cv2(msg, "bgr8")
+
+def callback_depth(msg):
+    global _depth
+    _depth = CvBridge().imgmsg_to_cv2(msg)
+
+def callback_low_image(msg):
+    global _low_image
+    _low_image = CvBridge().imgmsg_to_cv2(msg, "bgr8")
+
+def callback_low_depth(msg):
+    global _low_depth
+    _low_depth = CvBridge().imgmsg_to_cv2(msg)
+
+
+def move(dis, turn):
+    fb = Twist()
+    fb.linear.x = dis
+    fb.angular.z = turn
+    pub_cmd.publish(fb)
+
+def say(text):
+    global pub_speaker
+    pub_speaker.publish(text)
+    rospy.sleep(2)
+
+def find_user(image, depth):
+    global model
+
+    h, w = depth.shape
+    keypoints = model(image)[0].keypoints
+    user = []
+    user_d = -1
+    for pose in keypoints.xy:
+        mid_d = -1
+        for p in pose:
+            x, y = map(int , p)
+            cv2.circle(image, (x, y), 3, (0, 255, 0), -1)
+            if x >= w or y >= h: continue
+            if depth[y][x] > 0:
+                if mid_d == -1 or depth[y][x] < mid_d:
+                    mid_d = depth[y][x]
+        if (user_d == -1 or mid_d < user_d) and mid_d != -1:
+            user_d = mid_d
+            user = pose
+    return user
+
+
+def user_point_to_LR(pose):
+    if pose is None: return 0
+    if len(pose) == 0: return 0
+    x0, y0 = map(int, pose[0])
+    x8, y8 = map(int, pose[10])
+    if x0 == x8: return 0
+    k = (y0 - y8) / (x0 - x8)
+    # print(k)
+    if abs(k) > 1.2: return 0
+    if k > 0: return 1
+    return -1
+
+def bag_xy(dir,image):
+    h, w, cc = image.shape
+    result = luggage_model(image, verbose=False)[0]
+
+    boxes = result.boxes
+    
+    res = zip(boxes.cls, boxes.xyxy)
+    for c, xyxy in res:
+        x1, y1, x2, y2 = map(int, xyxy)
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        b = 0
+        if int((x1+x2)/2)>w//2: b = 1
+        print("dir,b                           ", dir, b)
+        if dir == b:
+            cv2.rectangle(image, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            return int((x1+x2)/2),int((y1+y2)/2)
+    return 0,0
+        
+            
+def change_to_cam(idx):
+    global _sub_cam_image, _sub_cam_depth, _current_cam
+    _current_cam = idx
+
+    if _sub_cam_image is not None:
+        _sub_cam_image.unregister()
+    if _sub_cam_depth is not None:
+        _sub_cam_depth.unregister()
+
+    if idx == 1:
+        _sub_cam_image = rospy.Subscriber("/camera/color/image_raw", Image, callback_image)
+        _sub_cam_depth = rospy.Subscriber("/camera/depth/image_raw", Image, callback_depth)
+    elif idx == 2:
+        _sub_cam_image = rospy.Subscriber("/cam1/rgb/image_raw", Image, callback_image)
+        _sub_cam_depth = rospy.Subscriber("/cam1/depth/image_raw", Image, callback_depth)
+
+def turn_to(angle: float, speed: float):
+    global _Imu
+    max_speed = 1.82
+    limit_time = 8
+    start_time = rospy.get_time()
+    while True:
+        q = [
+            _Imu.orientation.x,
+            _Imu.orientation.y,
+            _Imu.orientation.z,
+            _Imu.orientation.w
+        ]
+        roll, pitch, yaw = euler_from_quaternion(q)
+        e = angle - yaw
+        if yaw < 0 and angle > 0:
+            cw = np.pi + yaw + np.pi - angle
+            aw = -yaw + angle
+            if cw < aw:
+                e = -cw
+        elif yaw > 0 and angle < 0:
+            cw = yaw - angle
+            aw = np.pi - yaw + np.pi + angle
+            if aw < cw:
+                e = aw
+        if abs(e) < 0.01 or rospy.get_time() - start_time > limit_time:
+            break
+        move(0.0, max_speed * speed * e)
+        rospy.Rate(20).sleep()
+    move(0.0, 0.0)
+
+def turn(angle: float):
+    global _Imu
+    q = [
+        _Imu.orientation.x,
+        _Imu.orientation.y,
+        _Imu.orientation.z,
+        _Imu.orientation.w
+    ]
+    roll, pitch, yaw = euler_from_quaternion(q)
+    target = yaw + angle
+    if target > np.pi:
+        target = target - np.pi * 2
+    elif target < -np.pi:
+        target = target + np.pi * 2
+    turn_to(target, 0.5)
+
+def detect_real_xyz(x1,y1,d):
+    global image
+    h, w, c = image.shape
+    y1 -= h/2
+    x1 -= w/2
+    y = y1/h*2*d*math.tan(45.5*3.14159/360)
+    x = x1/w*2*d*math.tan(58.4*3.14159/360)
+    return x,y,d
+#math.atan2(x,z)
+def find_human_xy(user,image):
+    x1,y1,x2,y2 = 0,0,0,0 
+    num = 0
+    if user is not None:
+        for pp in user:
+            x, y = map(int, pp)
+            if num == 11: x1,y1 = x,y
+            elif num == 12: x2,y2 = x,y
+            cv2.circle(image, (x, y), 3, (0, 255, 0), -1)         
+            num+=1
+    x3,y3 = 0,0
+
+    if (x1 != 0 or x2 != 0) and (y1 != 0 or y2 != 0):
+        if x1 == 0: x3 = x2
+        elif x2 == 0: x3 = x1
+        else: x3 = int((x1+x2)/2)
+        if y1 == 0: y3 = y2
+        elif y2 == 0: y3 = y1
+        else: y3 = int((y1+y2)/2)
+    return x3,y3
+
+def find_speed(depth,x3,y3,lsp):
+    dis = depth[y3][x3] 
+    v = dis-650
+    print(v)
+    print(depth[y3][x3])
+    speed = float(v*0.0005)
+    print(speed)
+    if speed > 0.3: speed = 0.3
+    if speed-lsp>0.01: speed = lsp+0.01
+    if lsp-speed>0.01: speed = lsp-0.01
+    return speed
+
+def set_joints(joint1, joint2, joint3, joint4, t):
+    service_name = "/goal_joint_space_path"
+    rospy.wait_for_service(service_name)
+    
+    try:
+        service = rospy.ServiceProxy(service_name, SetJointPosition)
+        
+        request = SetJointPositionRequest()
+        request.joint_position.joint_name = ["joint1", "joint2", "joint3", "joint4"]
+        request.joint_position.position = [joint1, joint2, joint3, joint4]
+        request.path_time = t
+        
+        response = service(request)
+        return response
+    except Exception as e:
+        rospy.loginfo("%s" % e)
+        return False
+    
+if __name__ == "__main__":
+    rospy.init_node("demo")
+    rospy.loginfo("demo start")
+    chassis = RobotChassis()
+    rate = rospy.Rate(20)
+    _image = None
+    _depth = None
+    _voice = None
+    _Imu = None
+    rospy.Subscriber("/voice/text", Voice, callback_voice)
+    rospy.Subscriber("/imu/data", Imu, callback_Imu)
+    pub_speaker = rospy.Publisher("/speaker/say", String, queue_size=10)
+    pub_cmd = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+
+    
+    _sub_cam_image, _sub_cam_depth = None, None
+    _current_cam = 1
+    change_to_cam(1)
+    # rospy.Subscriber("/camera/color/image_raw", Image, callback_image)
+    # rospy.Subscriber("/camera/depth/image_raw", Image, callback_depth)
+    # rospy.Subscriber("/cam1/rgb/image_raw", Image, callback_low_image)
+    # rospy.Subscriber("/cam1/depth/image_raw", Image, callback_low_depth)
+
+    model_name = "yolov8n-pose.pt"
+    model = YOLO(model_name)
+    names = model.names.values()
+
+    luggage_model_name = "luggages.pt"  
+    luggage_model = YOLO(luggage_model_name)
+    luggage_names = luggage_model.names.values()
+    stime = time.time()
+    state = 0
+    p, i, d = 0.002, 0, 0
+    #pub_speaker.publish("voice ready")
+    point_dir = 0
+    say("voice ready")
+    rospy.sleep(1)
+    rate = rospy.Rate(20)
+    print("cliff")
+    mid_y = None
+    lsp = 0
+    while not rospy.is_shutdown():
+        rate.sleep()
+        if _image is None:
+            print("image none")
+            continue
+        if _depth is None: continue
+        if _Imu is None: continue
+        if len(_image) == 0 or len(_image[0]) == 0: continue
+        if len(_depth) == 0 or len(_depth[0]) == 0: continue
+        
+        image = _image.copy()
+        depth = _depth.copy()
+        h,w,c = image.shape
+        code = chassis.status_code
+        text = chassis.status_text
+        if _current_cam == 2:
+            image = cv2.rotate(image, cv2.ROTATE_180)
+            depth = cv2.rotate(depth, cv2.ROTATE_180)
+
+        if state == 0:
+            say("I am ready")
+            state = 1
+        elif state == 1:
+            if _current_cam != 1:
+                change_to_cam(1)
+                continue
+
+            user = find_user(image, depth)
+            if user is not None:
+                for p in user:
+                    x, y = map(int, p)
+                    cv2.circle(image, (x, y), 3, (0, 255, 0), -1)
+
+            if user is not None:
+                point_dir = user_point_to_LR(user)
+                # print(point_dir)
+                if point_dir == 1:
+                    say("the bag is on my right side")
+                    state = 2
+                elif point_dir == -1:
+                    point_dir = 0
+                    say("the bag is on my left side")
+                    state = 2
+            
+            # state = 2
+        elif state == 2:
+            if _current_cam != 2:
+                change_to_cam(2)
+                continue
+            print("point_dir:                 ", point_dir)
+            print("return:             ", bag_xy(point_dir,image))
+            
+            x1,y1 = bag_xy(point_dir,image)
+            mid_y = y1
+            print("x1,y1         ", x1,y1)
+            image = _image.copy()
+            depth = _depth.copy()
+            if _current_cam == 2:
+                image = cv2.rotate(image, cv2.ROTATE_180)
+                depth = cv2.rotate(depth, cv2.ROTATE_180)
+            if (x1 != 0 or y1 != 0) and depth[y1][x1] > 0:
+                pyautogui.screenshot("proof1")
+                x,y,z = detect_real_xyz(x1,y1,depth[y1][x1])
+                print("x,y,z:                    ", x, y, z)
+                print("point_dir:", point_dir)
+                turn(-(math.atan2(x,z)))
+                mid_y = y1
+                state = 3
+        elif state == 3:
+            image = _image.copy()
+            depth = _depth.copy()
+            if _current_cam == 2:
+                image = cv2.rotate(image, cv2.ROTATE_180)
+                depth = cv2.rotate(depth, cv2.ROTATE_180)
+            print("w//2:              ",w//2)
+            print("depth_shape               ",depth.shape)
+            print("mid_y:", mid_y)
+            print("depth:            ",depth[mid_y][w//2])
+            cv2.imshow("depth",depth)
+            cv2.waitKey(1)
+            sd = depth[mid_y][w//2]
+            print(sd)
+            if sd > 250:
+                move(0.1,0)
+            else:
+                state = 4
+                time.sleep(1)
+        elif state == 4:
+            t = 3.0
+            joint1, joint2, joint3, joint4 = 0,-1.5,1,0
+            set_joints(joint1, joint2, joint3, joint4, t)
+            time.sleep(t)
+
+            joint1, joint2, joint3, joint4 = 0,1,0,-1
+            set_joints(joint1, joint2, joint3, joint4, t)
+            time.sleep(t)
+
+            joint1, joint2, joint3, joint4 = 0,1.5,-1,-0.5
+            set_joints(joint1, joint2, joint3, joint4, t)
+            time.sleep(t)
+            
+            joint1, joint2, joint3, joint4 = 0,1.5,-1,-1
+            set_joints(joint1, joint2, joint3, joint4, t)
+            time.sleep(t)
+
+            joint1, joint2, joint3, joint4 = 0,-1.5,1,0
+            set_joints(joint1, joint2, joint3, joint4, t)
+            time.sleep(t)
+            state = 5
+        elif state == 5:
+            print("waiting")
+            if _current_cam != 1:
+                change_to_cam(1)
+                rospy.sleep(2)
+                continue
+            if _voice is not None:
+                data = _voice.text.lower()
+                if "follow" in data:
+                    say("follow you now")
+                    state = 6
+            _voice = None
+        elif state == 6:
+            if _voice is not None:
+                data = _voice.text.lower()
+                if "stop" in data or "store" in data:
+                    say("stop following you")
+                    t = 3.0
+                    joint1, joint2, joint3, joint4 = 0,0,0,-1
+                    set_joints(joint1, joint2, joint3, joint4, t)
+                    time.sleep(t)
+
+                    joint1, joint2, joint3, joint4 = 0,-1.5,1,0
+                    set_joints(joint1, joint2, joint3, joint4, t)
+                    time.sleep(t)
+                    state = 7
+            _voice = None
+            user = find_user(image, depth)
+            num = 0
+            if user is not None:
+                x3,y3 = find_human_xy(user,image)
+                if x3 != 0 and y3 != 0:
+                    speed = find_speed(depth,x3,y3,lsp)
+                    lsp = speed
+                    if depth[y3][x3]>675:
+                        if x3 > w//2+20:
+                            move(speed, float((w // 2 - x3) * 0.0015))   #turn right
+                        elif x3 < w//2-20:
+                            move(speed, float((w // 2 - x3) * 0.0015))   #turn left
+                        else: move(speed, 0)   #go front
+                        print("Go Front")
+                    elif depth[y3][x3] < 625:
+                        if x3 > w//2+50:
+                            move(speed/2, float((w // 2 - x3) * 0.0015))   #turn right
+                        elif x3 < w//2-50:
+                            move(speed/2, float((w // 2 - x3) * 0.0015))   #turn left
+                        else: move(speed/2, 0)
+                        print("Go Back")
+                        print(speed/2)
+                    else:  
+                        if x3 > w//2+20:
+                            move(0, float((w // 2 - x3) * 0.003))   #turn right
+                        elif x3 < w//2-20:
+                            move(0, float((w // 2 - x3) * 0.003))   #turn left
+                        print("Turn")
+                else:
+                    lsp = 0
+        elif state == 7:
+            # chassis.move_to(-0.115,-4.05,0)
+            chassis.move_to(9.33,41,0)
+            state = 8
+        elif state == 8:
+            if code == 3:
+                say("done")
+                print("done")
+                state = 9
+            elif code >= 4:
+                say("unable to arrive")
+                print("unable to arrive") 
+                state = 7
+        elif state == 9:
+            chassis.move_to(10.4,43,0)
+            state = 10
+        elif state == 10:
+            if code == 3:
+                say("done")
+                print("done")
+                break
+            elif code>=4:
+                say("unable to arrive")
+                print("unable to arrive") 
+                state = 9
+        cv2.imshow("image", image)
+        key_code = cv2.waitKey(1)
+        if key_code in [27, ord("q")]:
+            break
